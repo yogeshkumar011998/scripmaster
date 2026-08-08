@@ -260,6 +260,22 @@ async function forwardReplyToAdmin(replyText, requestedSymbol) {
   });
 }
 
+// user/group ko diye gaye reply ko 20 min baad delete karo
+const DELETE_AFTER_MS = 20 * 60 * 1000; // 20 minute
+
+function scheduleDelete(chatId, messageId) {
+  if (!messageId) return;
+
+  setTimeout(() => {
+    bot
+      .deleteMessage(chatId, messageId)
+      .catch((e) => {
+        // 48h se purana ya already deleted -> ignore
+        console.log(`[DELETE] skip: ${e.message}`);
+      });
+  }, DELETE_AFTER_MS);
+}
+
 // ============================================================
 // HELPERS
 // ============================================================
@@ -1417,8 +1433,8 @@ function createNseReply(data) {
       applicableMarginRate
     )}\n` +
     `<b>BULK DEAL (0.49%):</b> ${escapeHtml(bulkDeal)}\n` +
-    `<b>FINANCE:</b> ${finance}\n\n` +
-    `<b>APPROVED:</b> ${approved}`
+    `<b>APPROVED:</b> ${approved}\n\n` +
+    `<b>FINANCE:</b> ${finance}`
   );
 }
 
@@ -1773,6 +1789,7 @@ async function handleSymbol(chatId, requestedSymbol) {
         parse_mode: "HTML",
       });
       await forwardReplyToAdmin(replyText, requestedSymbol);
+      scheduleDelete(chatId, loadingMessage.message_id);
       return;
     }
 
@@ -1785,6 +1802,7 @@ async function handleSymbol(chatId, requestedSymbol) {
         parse_mode: "HTML",
       });
       await forwardReplyToAdmin(replyText, requestedSymbol);
+      scheduleDelete(chatId, loadingMessage.message_id);
       return;
     }
 
@@ -1817,6 +1835,8 @@ async function handleSymbol(chatId, requestedSymbol) {
 
       await forwardReplyToAdmin(suggestText, requestedSymbol);
 
+      scheduleDelete(chatId, loadingMessage.message_id);
+
       return;
     }
 
@@ -1830,6 +1850,8 @@ async function handleSymbol(chatId, requestedSymbol) {
     });
 
     await forwardReplyToAdmin(notFoundText, requestedSymbol);
+
+    scheduleDelete(chatId, loadingMessage.message_id);
   } catch (error) {
     console.error(
       `[ERROR] ${requestedSymbol}:`,
@@ -1853,13 +1875,17 @@ async function handleSymbol(chatId, requestedSymbol) {
           parse_mode: "HTML",
         });
 
+        scheduleDelete(chatId, loadingMessage.message_id);
+
         return;
       } catch (_) {}
     }
 
-    await bot.sendMessage(chatId, errorText, {
+    const sent = await bot.sendMessage(chatId, errorText, {
       parse_mode: "HTML",
     });
+
+    if (sent) scheduleDelete(chatId, sent.message_id);
   }
 }
 
@@ -1927,6 +1953,7 @@ bot.on("callback_query", async (query) => {
           }
         );
 
+        scheduleDelete(chatId, message.message_id);
         return;
       }
 
@@ -1957,6 +1984,7 @@ bot.on("callback_query", async (query) => {
             }
           );
 
+          scheduleDelete(chatId, message.message_id);
           return;
         }
       }
@@ -1982,6 +2010,7 @@ bot.on("callback_query", async (query) => {
           }
         );
 
+        scheduleDelete(chatId, message.message_id);
         return;
       }
     }
@@ -1995,6 +2024,8 @@ bot.on("callback_query", async (query) => {
         parse_mode: "HTML",
       }
     );
+
+    scheduleDelete(chatId, message.message_id);
   } catch (error) {
     console.error(
       `[CALLBACK ERROR] ${symbol}:`,
@@ -2178,7 +2209,7 @@ bot.on("polling_error", (error) => {
 
   notifyAdmin(
     `⚠️ <b>POLLING ERROR</b>\n\n${escapeHtml(msg)}\n\n` +
-      `(Ye ab tabhi dobara aayega jab error badle ya theek ho.)`,
+      `(It will appear again only if the error changes or gets resolved.)`,
     { parse_mode: "HTML" }
   );
 });
