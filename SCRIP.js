@@ -41,8 +41,12 @@ const path = require("path");
 const BOT_TOKEN =
   process.env.TELEGRAM_BOT_TOKEN;
 
-const ALLOWED_CHAT_ID = 8388096561;
-  //8388096561;
+// Admin ko sab kuch forward hoga (incoming msg + bot reply)
+const ADMIN_CHAT_ID = 8388096561;
+
+// block mode: true = sirf admin, false = sabko allow
+// /block se true, /open se false. Default open.
+let blockMode = false;
 
 const BULK_DEAL_PERCENT =
   0.49;
@@ -199,6 +203,63 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+// ============================================================
+// ADMIN FORWARD
+// ============================================================
+
+// admin ko plain text bhejo (fail ho to chup-chaap ignore)
+async function notifyAdmin(text, options = {}) {
+  try {
+    await bot.sendMessage(ADMIN_CHAT_ID, text, options);
+  } catch (e) {
+    console.log(`[ADMIN] forward fail: ${e.message}`);
+  }
+}
+
+// incoming user message ki info admin ko bhejo
+async function forwardIncomingToAdmin(msg, requestedSymbol) {
+  // admin khud message kare to dobara forward mat karo
+  if (String(msg.chat.id) === String(ADMIN_CHAT_ID)) {
+    return;
+  }
+
+  const from = msg.from || {};
+
+  const name = [from.first_name, from.last_name]
+    .filter(Boolean)
+    .join(" ");
+
+  const username = from.username
+    ? "@" + from.username
+    : "(no username)";
+
+  const chatType = msg.chat.type;
+
+  const info =
+    `📨 <b>NEW REQUEST</b>\n\n` +
+    `<b>Name:</b> ${escapeHtml(name || "-")}\n` +
+    `<b>Username:</b> ${escapeHtml(username)}\n` +
+    `<b>User ID:</b> ${escapeHtml(String(from.id || "-"))}\n` +
+    `<b>Chat type:</b> ${escapeHtml(chatType)}\n` +
+    `<b>Chat ID:</b> ${escapeHtml(String(msg.chat.id))}\n\n` +
+    `<b>Message:</b> ${escapeHtml(msg.text || "")}\n` +
+    `<b>Symbol:</b> ${escapeHtml(requestedSymbol || "-")}`;
+
+  await notifyAdmin(info, { parse_mode: "HTML" });
+}
+
+// bot ka reply admin ko bhi bhejo
+async function forwardReplyToAdmin(replyText, requestedSymbol) {
+  const header =
+    `↩️ <b>BOT REPLY</b> (${escapeHtml(
+      requestedSymbol || "-"
+    )})\n\n`;
+
+  await notifyAdmin(header + replyText, {
+    parse_mode: "HTML",
+  });
 }
 
 // ============================================================
@@ -1581,28 +1642,30 @@ async function handleSymbol(chatId, requestedSymbol) {
 
     // NSE
     if (result.kind === "NSE") {
-      await bot.editMessageText(
-        createNseReply(result.data),
-        {
-          chat_id: chatId,
-          message_id: loadingMessage.message_id,
-          parse_mode: "HTML",
-        }
-      );
+      const replyText = createNseReply(result.data);
+
+      await bot.editMessageText(replyText, {
+        chat_id: chatId,
+        message_id: loadingMessage.message_id,
+        parse_mode: "HTML",
+      });
+
+      await forwardReplyToAdmin(replyText, requestedSymbol);
 
       return;
     }
 
     // BSE
     if (result.kind === "BSE") {
-      await bot.editMessageText(
-        createBseReply(result.data),
-        {
-          chat_id: chatId,
-          message_id: loadingMessage.message_id,
-          parse_mode: "HTML",
-        }
-      );
+      const replyText = createBseReply(result.data);
+
+      await bot.editMessageText(replyText, {
+        chat_id: chatId,
+        message_id: loadingMessage.message_id,
+        parse_mode: "HTML",
+      });
+
+      await forwardReplyToAdmin(replyText, requestedSymbol);
 
       return;
     }
@@ -1617,35 +1680,38 @@ async function handleSymbol(chatId, requestedSymbol) {
         (m) => m.exchange === "BSE"
       ).length;
 
-      await bot.editMessageText(
+      const suggestText =
         `🔎 <b>${escapeHtml(
           requestedSymbol
         )}</b> exact match nahi mila.\n\n` +
-          `${result.matches.length} results ` +
-          `(NSE: ${nseCount}, BSE: ${bseCount}).\n\n` +
-          `Select karo:`,
-        {
-          chat_id: chatId,
-          message_id: loadingMessage.message_id,
-          parse_mode: "HTML",
-          reply_markup: buildCombinedSuggestionKeyboard(
-            result.matches
-          ),
-        }
-      );
+        `${result.matches.length} results ` +
+        `(NSE: ${nseCount}, BSE: ${bseCount}).\n\n` +
+        `Select karo:`;
+
+      await bot.editMessageText(suggestText, {
+        chat_id: chatId,
+        message_id: loadingMessage.message_id,
+        parse_mode: "HTML",
+        reply_markup: buildCombinedSuggestionKeyboard(
+          result.matches
+        ),
+      });
+
+      await forwardReplyToAdmin(suggestText, requestedSymbol);
 
       return;
     }
 
     // NOT FOUND
-    await bot.editMessageText(
-      createNotFoundReply(requestedSymbol),
-      {
-        chat_id: chatId,
-        message_id: loadingMessage.message_id,
-        parse_mode: "HTML",
-      }
-    );
+    const notFoundText = createNotFoundReply(requestedSymbol);
+
+    await bot.editMessageText(notFoundText, {
+      chat_id: chatId,
+      message_id: loadingMessage.message_id,
+      parse_mode: "HTML",
+    });
+
+    await forwardReplyToAdmin(notFoundText, requestedSymbol);
   } catch (error) {
     console.error(
       `[ERROR] ${requestedSymbol}:`,
@@ -1658,6 +1724,8 @@ async function handleSymbol(chatId, requestedSymbol) {
         requestedSymbol
       )}\n\n` +
       escapeHtml(error.message);
+
+    await forwardReplyToAdmin(errorText, requestedSymbol);
 
     if (loadingMessage) {
       try {
@@ -1815,6 +1883,13 @@ bot.on("callback_query", async (query) => {
       error.message
     );
 
+    await notifyAdmin(
+      `❌ <b>CALLBACK ERROR</b> (${escapeHtml(
+        symbol
+      )})\n\n${escapeHtml(error.message)}`,
+      { parse_mode: "HTML" }
+    );
+
     try {
       await bot.editMessageText(
         `❌ <b>ERROR</b>\n\n${escapeHtml(
@@ -1849,15 +1924,49 @@ bot.on("message", async (msg) => {
     chatType === "group" ||
     chatType === "supergroup";
 
-  if (
-    isPrivate &&
-    String(chatId) !== String(ALLOWED_CHAT_ID)
-  ) {
-    console.log(`[BLOCKED PRIVATE] ${chatId}`);
+  if (!isPrivate && !isGroup) {
     return;
   }
 
-  if (!isPrivate && !isGroup) {
+  const isAdmin =
+    String(chatId) === String(ADMIN_CHAT_ID);
+
+  // -------- ADMIN COMMANDS (sirf admin private) --------
+  if (isAdmin && isPrivate) {
+    const cmd = text.toLowerCase();
+
+    if (cmd === "/block") {
+      blockMode = true;
+      await bot.sendMessage(
+        chatId,
+        "🔒 BLOCK ON — ab sirf admin bot use kar sakega."
+      );
+      return;
+    }
+
+    if (cmd === "/open") {
+      blockMode = false;
+      await bot.sendMessage(
+        chatId,
+        "🔓 OPEN — ab sabko allow hai."
+      );
+      return;
+    }
+
+    if (cmd === "/status") {
+      await bot.sendMessage(
+        chatId,
+        blockMode
+          ? "🔒 Abhi BLOCK mode (sirf admin)."
+          : "🔓 Abhi OPEN mode (sabko allow)."
+      );
+      return;
+    }
+  }
+
+  // -------- BLOCK MODE: sirf admin allow --------
+  if (blockMode && !isAdmin) {
+    console.log(`[BLOCKED] ${chatId} (block mode)`);
     return;
   }
 
@@ -1922,6 +2031,9 @@ bot.on("message", async (msg) => {
     `\n[TELEGRAM] ${chatType} ${chatId} → ${requestedSymbol}`
   );
 
+  // admin ko incoming request forward karo (username + msg)
+  await forwardIncomingToAdmin(msg, requestedSymbol);
+
   await handleSymbol(chatId, requestedSymbol);
 });
 
@@ -1933,6 +2045,13 @@ bot.on("polling_error", (error) => {
   console.error(
     "TELEGRAM POLLING ERROR:",
     error.message
+  );
+
+  notifyAdmin(
+    `⚠️ <b>POLLING ERROR</b>\n\n${escapeHtml(
+      error.message
+    )}`,
+    { parse_mode: "HTML" }
   );
 });
 
@@ -1953,6 +2072,29 @@ async function shutdown() {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
+// koi bhi unexpected error -> admin ko bhejo (crash na ho)
+process.on("uncaughtException", (err) => {
+  console.error("[UNCAUGHT]", err.message);
+  notifyAdmin(
+    `🛑 <b>UNCAUGHT ERROR</b>\n\n${escapeHtml(
+      err.message
+    )}`,
+    { parse_mode: "HTML" }
+  );
+});
+
+process.on("unhandledRejection", (reason) => {
+  const msg =
+    reason && reason.message
+      ? reason.message
+      : String(reason);
+  console.error("[UNHANDLED]", msg);
+  notifyAdmin(
+    `🛑 <b>UNHANDLED REJECTION</b>\n\n${escapeHtml(msg)}`,
+    { parse_mode: "HTML" }
+  );
+});
+
 // ============================================================
 // START
 // ============================================================
@@ -1964,7 +2106,8 @@ console.log("     NSE + BSE TELEGRAM BOT STARTED");
 console.log(
   "========================================"
 );
-console.log(`Private allowed: ${ALLOWED_CHAT_ID}`);
+console.log(`Admin forward: ${ADMIN_CHAT_ID}`);
+console.log("Private: ALL allowed");
 console.log("Group: only S/SYMBOL");
 console.log("Mode: Pure Node API (NO CHROME)");
 console.log(`NSE series: ${SERIES_LIST.join(", ")}`);
