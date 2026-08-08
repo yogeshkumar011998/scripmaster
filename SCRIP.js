@@ -47,6 +47,69 @@ const ADMIN_CHAT_ID = 8388096561;
 // block mode: true = sirf admin, false = sabko allow
 let blockMode = false;
 
+// ---- BLOCKED IDs (permanent, blocked.json me) ----
+const BLOCKED_FILE = path.join(__dirname, "blocked.json");
+
+// Set of blocked chat IDs (string)
+let blockedIds = new Set();
+
+// blocked.json load karo (startup par)
+function loadBlockedIds() {
+  try {
+    if (fs.existsSync(BLOCKED_FILE)) {
+      const raw = fs.readFileSync(BLOCKED_FILE, "utf8");
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) {
+        blockedIds = new Set(arr.map((x) => String(x)));
+      }
+    }
+  } catch (e) {
+    console.log(`[BLOCKED] load fail: ${e.message}`);
+  }
+
+  console.log(
+    `[BLOCKED] loaded ${blockedIds.size} id(s)`
+  );
+}
+
+// blocked.json save + GitHub pe commit (permanent)
+function saveBlockedIds() {
+  try {
+    fs.writeFileSync(
+      BLOCKED_FILE,
+      JSON.stringify([...blockedIds], null, 2),
+      "utf8"
+    );
+  } catch (e) {
+    console.log(`[BLOCKED] save fail: ${e.message}`);
+    return;
+  }
+
+  // GitHub Actions me file permanent karne ke liye git commit
+  gitCommitBlocked();
+}
+
+// git add + commit + push (GitHub Actions par)
+function gitCommitBlocked() {
+  const { exec } = require("child_process");
+
+  const cmd =
+    'git add blocked.json && ' +
+    'git -c user.name="bot" -c user.email="bot@bot" ' +
+    'commit -m "update blocked list" && git push';
+
+  exec(cmd, { cwd: __dirname }, (err, stdout, stderr) => {
+    if (err) {
+      // nothing-to-commit ya push fail -> log only
+      console.log(
+        `[GIT] ${(stderr || err.message || "").trim()}`
+      );
+    } else {
+      console.log("[GIT] blocked.json pushed");
+    }
+  });
+}
+
 // polling error state (baar-baar spam na ho)
 let lastPollErrorMsg = "";   // aakhri error jo admin ko bheja
 let pollErrorActive = false;  // abhi error chal raha hai?
@@ -261,7 +324,7 @@ async function forwardReplyToAdmin(replyText, requestedSymbol) {
 }
 
 // user/group ko diye gaye reply ko 20 min baad delete karo
-const DELETE_AFTER_MS = 20 * 60 * 1000; // 20 minute
+const DELETE_AFTER_MS = 10 * 60 * 1000; // 20 minute
 
 function scheduleDelete(chatId, messageId) {
   if (!messageId) return;
@@ -2111,6 +2174,90 @@ bot.on("message", async (msg) => {
       );
       return;
     }
+
+    // ---- block this id : 12345 ----
+    const blockMatch = text.match(
+      /^block\s+this\s+id\s*:?\s*(-?\d+)/i
+    );
+
+    if (blockMatch) {
+      const id = blockMatch[1];
+      blockedIds.add(String(id));
+      saveBlockedIds();
+      await bot.sendMessage(
+        chatId,
+        `⛔ ID <code>${escapeHtml(
+          id
+        )}</code> block ho gaya.\nTotal blocked: ${
+          blockedIds.size
+        }`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    // ---- unblock this id : 12345 ----
+    const unblockMatch = text.match(
+      /^unblock\s+this\s+id\s*:?\s*(-?\d+)/i
+    );
+
+    if (unblockMatch) {
+      const id = unblockMatch[1];
+      const had = blockedIds.delete(String(id));
+      saveBlockedIds();
+      await bot.sendMessage(
+        chatId,
+        had
+          ? `✅ ID <code>${escapeHtml(
+              id
+            )}</code> unblock ho gaya.\nTotal blocked: ${
+              blockedIds.size
+            }`
+          : `ℹ️ ID <code>${escapeHtml(
+              id
+            )}</code> list me tha hi nahi.`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    // ---- blocked list ----
+    if (
+      cmd === "blocked list" ||
+      cmd === "block list" ||
+      cmd === "/blocked"
+    ) {
+      if (blockedIds.size === 0) {
+        await bot.sendMessage(
+          chatId,
+          "📃 Blocked list khali hai."
+        );
+      } else {
+        const list = [...blockedIds]
+          .map((id, i) => `${i + 1}. <code>${escapeHtml(id)}</code>`)
+          .join("\n");
+        await bot.sendMessage(
+          chatId,
+          `📃 <b>BLOCKED IDs (${blockedIds.size})</b>\n\n${list}`,
+          { parse_mode: "HTML" }
+        );
+      }
+      return;
+    }
+  }
+
+  // -------- ye ID blocked hai? (admin chhod ke) --------
+  const fromId = msg.from ? String(msg.from.id) : "";
+
+  if (
+    !isAdmin &&
+    (blockedIds.has(String(chatId)) ||
+      (fromId && blockedIds.has(fromId)))
+  ) {
+    console.log(
+      `[BLOCKED-ID] chat ${chatId} / user ${fromId} ignored`
+    );
+    return;
   }
 
   // -------- BLOCK MODE: sirf admin allow --------
@@ -2223,7 +2370,7 @@ setInterval(() => {
       pollErrorActive = false;
       lastPollErrorMsg = "";
       notifyAdmin(
-        "✅ <b>OK</b> — bot theek ho gaya, ab chal raha hai.",
+        "✅ <b>OK</b> — The bot is fixed now and is running",
         { parse_mode: "HTML" }
       );
     }
@@ -2291,6 +2438,9 @@ console.log(
 console.log("BSE: live search API (no CSV)");
 
 console.log("Waiting for Telegram messages...\n");
+
+// blocked IDs load karo (blocked.json se)
+loadBlockedIds();
 
 // startup par cookies pehle se le lo (pehli request fast ho)
 ensureNseCookies(true).catch(() => {});
