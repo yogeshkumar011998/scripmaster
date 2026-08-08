@@ -45,7 +45,6 @@ const BOT_TOKEN =
 const ADMIN_CHAT_ID = 8388096561;
 
 // block mode: true = sirf admin, false = sabko allow
-// /block se true, /open se false. Default open.
 let blockMode = false;
 
 const BULK_DEAL_PERCENT =
@@ -209,7 +208,6 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
 // ADMIN FORWARD
 // ============================================================
 
-// admin ko plain text bhejo (fail ho to chup-chaap ignore)
 async function notifyAdmin(text, options = {}) {
   try {
     await bot.sendMessage(ADMIN_CHAT_ID, text, options);
@@ -218,9 +216,7 @@ async function notifyAdmin(text, options = {}) {
   }
 }
 
-// incoming user message ki info admin ko bhejo
 async function forwardIncomingToAdmin(msg, requestedSymbol) {
-  // admin khud message kare to dobara forward mat karo
   if (String(msg.chat.id) === String(ADMIN_CHAT_ID)) {
     return;
   }
@@ -235,14 +231,12 @@ async function forwardIncomingToAdmin(msg, requestedSymbol) {
     ? "@" + from.username
     : "(no username)";
 
-  const chatType = msg.chat.type;
-
   const info =
     `📨 <b>NEW REQUEST</b>\n\n` +
     `<b>Name:</b> ${escapeHtml(name || "-")}\n` +
     `<b>Username:</b> ${escapeHtml(username)}\n` +
     `<b>User ID:</b> ${escapeHtml(String(from.id || "-"))}\n` +
-    `<b>Chat type:</b> ${escapeHtml(chatType)}\n` +
+    `<b>Chat type:</b> ${escapeHtml(msg.chat.type)}\n` +
     `<b>Chat ID:</b> ${escapeHtml(String(msg.chat.id))}\n\n` +
     `<b>Message:</b> ${escapeHtml(msg.text || "")}\n` +
     `<b>Symbol:</b> ${escapeHtml(requestedSymbol || "-")}`;
@@ -250,7 +244,6 @@ async function forwardIncomingToAdmin(msg, requestedSymbol) {
   await notifyAdmin(info, { parse_mode: "HTML" });
 }
 
-// bot ka reply admin ko bhi bhejo
 async function forwardReplyToAdmin(replyText, requestedSymbol) {
   const header =
     `↩️ <b>BOT REPLY</b> (${escapeHtml(
@@ -1005,6 +998,20 @@ function parseNseEntry(entry, upperSymbol, foundSeries) {
     isin
   );
 
+  // STATUS: suspended hai ya active
+  const suspFlag = String(sec.isSuspended || "").toLowerCase();
+  const secStatus = String(sec.secStatus || "").toLowerCase();
+
+  const isSuspended =
+    suspFlag.includes("suspend") ||
+    secStatus.includes("suspend");
+
+  const status = isSuspended
+    ? `⛔ SUSPENDED${
+        sec.secStatus ? " (" + sec.secStatus + ")" : ""
+      }`
+    : "✅ ACTIVE";
+
   return {
     exchange: "NSE",
     series: foundSeries || trade.series || meta.series || "-",
@@ -1018,6 +1025,8 @@ function parseNseEntry(entry, upperSymbol, foundSeries) {
     applicableMarginRate,
     bulkDeal,
     approval,
+    status,
+    isSuspended,
   };
 }
 
@@ -1116,6 +1125,28 @@ async function getNseDataBySeries(symbol, series) {
 // BSE: fetch APIs
 // ============================================================
 
+// BSE VAR + Applicable Margin (SecurityVar, AMR) - alag API
+async function fetchBseVar(scripCode) {
+  const url =
+    "https://api.bseindia.com/BseIndiaAPI/api/VarMargin/w" +
+    "?getquotetype=EQ&scripcode=" +
+    encodeURIComponent(scripCode);
+
+  try {
+    const res = await fetchWithTimeout(
+      url,
+      { headers: BSE_HEADERS },
+      8000
+    );
+
+    if (!res.ok) return null;
+
+    return await res.json();
+  } catch (_) {
+    return null;
+  }
+}
+
 async function fetchBseTrading(scripCode) {
   const url =
     "https://api.bseindia.com/BseIndiaAPI/api/StockTrading/w" +
@@ -1189,14 +1220,31 @@ async function getBseData(scripRow) {
     `[BSE] fetch ${scripRow.symbol} (scrip ${scripCode})`
   );
 
-  const [trading, header, headerData] = await Promise.all([
-    fetchBseTrading(scripCode),
-    fetchBseHeader(scripCode),
-    fetchBseHeaderData(scripCode),
-  ]);
+  const [trading, header, headerData, varData] =
+    await Promise.all([
+      fetchBseTrading(scripCode),
+      fetchBseHeader(scripCode),
+      fetchBseHeaderData(scripCode),
+      fetchBseVar(scripCode),
+    ]);
 
   if (!trading && !header && !headerData) {
     return null;
+  }
+
+  // BSE VAR (SecurityVar) + Applicable Margin (AMR)
+  let securityVar = "N/A";
+  let applicableMarginRate = "N/A";
+
+  if (varData) {
+    if (varData.SecurityVar != null &&
+        cleanNumber(varData.SecurityVar) !== null) {
+      securityVar = String(varData.SecurityVar);
+    }
+    if (varData.AMR != null &&
+        cleanNumber(varData.AMR) !== null) {
+      applicableMarginRate = String(varData.AMR);
+    }
   }
 
   const isin =
@@ -1252,6 +1300,30 @@ async function getBseData(scripRow) {
 
   const approval = checkApproval(scripRow.symbol, isin);
 
+  // STATUS: Category se (Listed / Suspended / Delisted)
+  const category = String(
+    (headerData &&
+      headerData.Cmpname &&
+      headerData.Cmpname.Category) ||
+      (header && header.Category) ||
+      ""
+  );
+
+  const catLower = category.toLowerCase();
+
+  const isSuspended =
+    catLower.includes("suspend") ||
+    catLower.includes("delist");
+
+  let status;
+  if (isSuspended) {
+    status = `⛔ ${category.toUpperCase()}`;
+  } else if (category) {
+    status = `✅ ${category.toUpperCase()}`;
+  } else {
+    status = "N/A";
+  }
+
   console.log(`[BSE] ${scripRow.symbol} done`);
 
   return {
@@ -1267,8 +1339,12 @@ async function getBseData(scripRow) {
     marketCapFF,
     group,
     industry,
+    securityVar,
+    applicableMarginRate,
     bulkDeal,
     approval,
+    status,
+    isSuspended,
   };
 }
 
@@ -1308,13 +1384,26 @@ function createNseReply(data) {
       ? "N/A"
       : `₹${formatIndianNumber(data.bulkDeal)} Cr`;
 
+  const varNum = cleanNumber(data.securityVar);
+  let finance;
+  if (data.isSuspended) {
+    finance = "❌ NOT ALLOWED (Suspended)";
+  } else if (varNum === null) {
+    finance = "N/A (VAR nahi mila)";
+  } else if (varNum < 100) {
+    finance = "✅ ALLOWED";
+  } else {
+    finance = "❌ NOT ALLOWED";
+  }
+
   return (
     `📊 <b>STOCK DATA</b>\n\n` +
     `<b>EXCHANGE:</b> NSE\n` +
     `<b>SYMBOL:</b> ${escapeHtml(data.symbol)}\n` +
     `<b>SERIES:</b> ${escapeHtml(data.series)}\n` +
     `<b>COMPANY:</b> ${escapeHtml(data.company)}\n` +
-    `<b>ISIN:</b> ${escapeHtml(data.isin)}\n\n` +
+    `<b>ISIN:</b> ${escapeHtml(data.isin)}\n` +
+    `<b>STATUS:</b> ${escapeHtml(data.status || "N/A")}\n\n` +
     `<b>LTP:</b> ${escapeHtml(ltp)}\n` +
     `<b>PREV CLOSE:</b> ${escapeHtml(prevClose)}\n` +
     `<b>MARKET CAP:</b> ${escapeHtml(marketCap)}\n` +
@@ -1322,8 +1411,10 @@ function createNseReply(data) {
     `<b>APPLICABLE MARGIN:</b> ${escapeHtml(
       applicableMarginRate
     )}\n` +
-    `<b>BULK DEAL (0.49%):</b> ${escapeHtml(bulkDeal)}\n\n` +
-    `<b>APPROVED:</b> ${approved}`
+    `<b>BULK DEAL (0.49%):</b> ${escapeHtml(bulkDeal)}\n` +
+    `<b>APPROVED:</b> ${approved}\n\n` +
+    `<b>FINANCE:</b> ${finance}`
+    
   );
 }
 
@@ -1357,6 +1448,29 @@ function createBseReply(data) {
       ? "N/A"
       : `₹${formatIndianNumber(data.bulkDeal)} Cr`;
 
+  const securityVar =
+    !data.securityVar || data.securityVar === "N/A"
+      ? "N/A"
+      : `${data.securityVar}%`;
+
+  const applicableMarginRate =
+    !data.applicableMarginRate ||
+    data.applicableMarginRate === "N/A"
+      ? "N/A"
+      : `${data.applicableMarginRate}%`;
+
+  const varNum = cleanNumber(data.securityVar);
+  let finance;
+  if (data.isSuspended) {
+    finance = "❌ NOT ALLOWED (Suspended)";
+  } else if (varNum === null) {
+    finance = "N/A (VAR nahi mila)";
+  } else if (varNum < 100) {
+    finance = "✅ ALLOWED";
+  } else {
+    finance = "❌ NOT ALLOWED";
+  }
+
   return (
     `📊 <b>STOCK DATA</b>\n\n` +
     `<b>EXCHANGE:</b> BSE\n` +
@@ -1365,12 +1479,18 @@ function createBseReply(data) {
     `<b>COMPANY:</b> ${escapeHtml(data.company)}\n` +
     `<b>ISIN:</b> ${escapeHtml(data.isin)}\n` +
     `<b>GROUP:</b> ${escapeHtml(data.group)}\n` +
-    `<b>INDUSTRY:</b> ${escapeHtml(data.industry)}\n\n` +
+    `<b>INDUSTRY:</b> ${escapeHtml(data.industry)}\n` +
+    `<b>STATUS:</b> ${escapeHtml(data.status || "N/A")}\n\n` +
     `<b>LTP:</b> ${escapeHtml(ltp)}\n` +
     `<b>PREV CLOSE:</b> ${escapeHtml(prevClose)}\n` +
     `<b>WAP:</b> ${escapeHtml(wap)}\n` +
     `<b>MARKET CAP (FULL):</b> ${escapeHtml(marketCap)}\n` +
-    `<b>BULK DEAL (0.49%):</b> ${escapeHtml(bulkDeal)}\n\n` +
+    `<b>SECURITY VAR:</b> ${escapeHtml(securityVar)}\n` +
+    `<b>APPLICABLE MARGIN:</b> ${escapeHtml(
+      applicableMarginRate
+    )}\n` +
+    `<b>BULK DEAL (0.49%):</b> ${escapeHtml(bulkDeal)}\n` +
+    `<b>FINANCE:</b> ${finance}\n\n` +
     `<b>APPROVED:</b> ${approved}`
   );
 }
@@ -1643,30 +1763,24 @@ async function handleSymbol(chatId, requestedSymbol) {
     // NSE
     if (result.kind === "NSE") {
       const replyText = createNseReply(result.data);
-
       await bot.editMessageText(replyText, {
         chat_id: chatId,
         message_id: loadingMessage.message_id,
         parse_mode: "HTML",
       });
-
       await forwardReplyToAdmin(replyText, requestedSymbol);
-
       return;
     }
 
     // BSE
     if (result.kind === "BSE") {
       const replyText = createBseReply(result.data);
-
       await bot.editMessageText(replyText, {
         chat_id: chatId,
         message_id: loadingMessage.message_id,
         parse_mode: "HTML",
       });
-
       await forwardReplyToAdmin(replyText, requestedSymbol);
-
       return;
     }
 
@@ -1970,16 +2084,6 @@ bot.on("message", async (msg) => {
     return;
   }
 
-  if (isGroup) {
-    const groupCommand = text.match(
-      /^S\/([A-Z0-9&._-]+)$/i
-    );
-
-    if (!groupCommand) {
-      return;
-    }
-  }
-
   if (
     isPrivate &&
     text.toLowerCase() === "/start"
@@ -1988,24 +2092,33 @@ bot.on("message", async (msg) => {
       chatId,
       "📊 NSE + BSE Stock Bot\n\n" +
         "Command:\n" +
-        "S/RELIANCE  (exact)\n" +
-        "S/RELI      (partial -> suggestions)"
+        "RELIANCE     (seedha symbol)\n" +
+        "S/RELIANCE   (S/ ke saath bhi)\n" +
+        "RELI         (partial -> suggestions)"
     );
 
     return;
   }
 
-  const match = text.match(
-    /^S\/([A-Z0-9&._-]+)$/i
-  );
+  // ---- SYMBOL nikalna ----
+  // GROUP: sirf S/SYMBOL
+  // PRIVATE: S/SYMBOL bhi, seedha SYMBOL bhi
+  let requestedSymbol = null;
 
-  if (!match) {
-    return;
+  const withPrefix = text.match(/^S\/([A-Z0-9&._-]+)$/i);
+
+  if (withPrefix) {
+    requestedSymbol = withPrefix[1].trim().toUpperCase();
+  } else if (isPrivate) {
+    const plain = text.match(/^([A-Za-z0-9&._-]+)$/);
+    if (plain) {
+      requestedSymbol = plain[1].trim().toUpperCase();
+    }
   }
 
-  const requestedSymbol = match[1]
-    .trim()
-    .toUpperCase();
+  if (!requestedSymbol) {
+    return;
+  }
 
   // duplicate guard: same symbol 8 sec ke andar dobara -> ignore
   const dupKey = `${chatId}:${requestedSymbol}`;
@@ -2031,7 +2144,6 @@ bot.on("message", async (msg) => {
     `\n[TELEGRAM] ${chatType} ${chatId} → ${requestedSymbol}`
   );
 
-  // admin ko incoming request forward karo (username + msg)
   await forwardIncomingToAdmin(msg, requestedSymbol);
 
   await handleSymbol(chatId, requestedSymbol);
@@ -2072,7 +2184,6 @@ async function shutdown() {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-// koi bhi unexpected error -> admin ko bhejo (crash na ho)
 process.on("uncaughtException", (err) => {
   console.error("[UNCAUGHT]", err.message);
   notifyAdmin(
@@ -2107,7 +2218,7 @@ console.log(
   "========================================"
 );
 console.log(`Admin forward: ${ADMIN_CHAT_ID}`);
-console.log("Private: ALL allowed");
+console.log("Private: ALL allowed (direct symbol OK)");
 console.log("Group: only S/SYMBOL");
 console.log("Mode: Pure Node API (NO CHROME)");
 console.log(`NSE series: ${SERIES_LIST.join(", ")}`);
