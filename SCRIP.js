@@ -47,6 +47,11 @@ const ADMIN_CHAT_ID = 8388096561;
 // block mode: true = sirf admin, false = sabko allow
 let blockMode = false;
 
+// polling error state (baar-baar spam na ho)
+let lastPollErrorMsg = "";   // aakhri error jo admin ko bheja
+let pollErrorActive = false;  // abhi error chal raha hai?
+let lastPollOkTime = Date.now();
+
 const BULK_DEAL_PERCENT =
   0.49;
 
@@ -1412,9 +1417,8 @@ function createNseReply(data) {
       applicableMarginRate
     )}\n` +
     `<b>BULK DEAL (0.49%):</b> ${escapeHtml(bulkDeal)}\n` +
-    `<b>APPROVED:</b> ${approved}\n\n` +
-    `<b>FINANCE:</b> ${finance}`
-    
+    `<b>FINANCE:</b> ${finance}\n\n` +
+    `<b>APPROVED:</b> ${approved}`
   );
 }
 
@@ -2159,13 +2163,41 @@ bot.on("polling_error", (error) => {
     error.message
   );
 
+  const msg = error.message || "unknown";
+
+  // har error par time reset (recovery isi se decide hota hai)
+  lastPollOkTime = Date.now();
+
+  // same error dobara-dobara na bhejo, sirf pehli baar
+  if (pollErrorActive && msg === lastPollErrorMsg) {
+    return;
+  }
+
+  pollErrorActive = true;
+  lastPollErrorMsg = msg;
+
   notifyAdmin(
-    `⚠️ <b>POLLING ERROR</b>\n\n${escapeHtml(
-      error.message
-    )}`,
+    `⚠️ <b>POLLING ERROR</b>\n\n${escapeHtml(msg)}\n\n` +
+      `(Ye ab tabhi dobara aayega jab error badle ya theek ho.)`,
     { parse_mode: "HTML" }
   );
 });
+
+// recovery detect: agar error active tha aur pichle 35s me
+// koi naya poll error nahi aaya -> "OK theek ho gaya" bhejo
+setInterval(() => {
+  if (pollErrorActive) {
+    const sinceErr = Date.now() - lastPollOkTime;
+    if (sinceErr > 35000) {
+      pollErrorActive = false;
+      lastPollErrorMsg = "";
+      notifyAdmin(
+        "✅ <b>OK</b> — bot theek ho gaya, ab chal raha hai.",
+        { parse_mode: "HTML" }
+      );
+    }
+  }
+}, 30000);
 
 // ============================================================
 // SHUTDOWN
