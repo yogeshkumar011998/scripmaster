@@ -41,7 +41,7 @@ const path = require("path");
 const BOT_TOKEN =
   process.env.TELEGRAM_BOT_TOKEN;
 
-const ALLOWED_CHAT_ID = -1003045195376;
+const ALLOWED_CHAT_ID = 8388096561;
   //8388096561;
 
 const BULK_DEAL_PERCENT =
