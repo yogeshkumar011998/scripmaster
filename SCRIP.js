@@ -28,25 +28,8 @@
 require("dotenv").config({ quiet: true });
 
 const TelegramBotModule = require("node-telegram-bot-api");
-
-// package ke version ke hisaab se constructor alag jagah ho sakta hai
-let TelegramBot = TelegramBotModule;
-
-if (typeof TelegramBot !== "function") {
-  if (typeof TelegramBotModule.default === "function") {
-    TelegramBot = TelegramBotModule.default;
-  } else if (typeof TelegramBotModule.TelegramBot === "function") {
-    TelegramBot = TelegramBotModule.TelegramBot;
-  }
-}
-
-if (typeof TelegramBot !== "function") {
-  console.error(
-    "ERROR: TelegramBot constructor nahi mila. " +
-      "node-telegram-bot-api sahi install nahi hua."
-  );
-  process.exit(1);
-}
+const TelegramBot =
+  TelegramBotModule.default || TelegramBotModule;
 
 const fs = require("fs");
 const path = require("path");
@@ -58,8 +41,79 @@ const path = require("path");
 const BOT_TOKEN =
   process.env.TELEGRAM_BOT_TOKEN;
 
-const ALLOWED_CHAT_ID = -1003045195376;
-  //8388096561;
+// Admin ko sab kuch forward hoga (incoming msg + bot reply)
+const ADMIN_CHAT_ID = 8388096561;
+
+// block mode: true = sirf admin, false = sabko allow
+let blockMode = false;
+
+// ---- BLOCKED IDs (permanent, blocked.json me) ----
+const BLOCKED_FILE = path.join(__dirname, "blocked.json");
+
+// Set of blocked chat IDs (string)
+let blockedIds = new Set();
+
+// blocked.json load karo (startup par)
+function loadBlockedIds() {
+  try {
+    if (fs.existsSync(BLOCKED_FILE)) {
+      const raw = fs.readFileSync(BLOCKED_FILE, "utf8");
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) {
+        blockedIds = new Set(arr.map((x) => String(x)));
+      }
+    }
+  } catch (e) {
+    console.log(`[BLOCKED] load fail: ${e.message}`);
+  }
+
+  console.log(
+    `[BLOCKED] loaded ${blockedIds.size} id(s)`
+  );
+}
+
+// blocked.json save + GitHub pe commit (permanent)
+function saveBlockedIds() {
+  try {
+    fs.writeFileSync(
+      BLOCKED_FILE,
+      JSON.stringify([...blockedIds], null, 2),
+      "utf8"
+    );
+  } catch (e) {
+    console.log(`[BLOCKED] save fail: ${e.message}`);
+    return;
+  }
+
+  // GitHub Actions me file permanent karne ke liye git commit
+  gitCommitBlocked();
+}
+
+// git add + commit + push (GitHub Actions par)
+function gitCommitBlocked() {
+  const { exec } = require("child_process");
+
+  const cmd =
+    'git add blocked.json && ' +
+    'git -c user.name="bot" -c user.email="bot@bot" ' +
+    'commit -m "update blocked list" && git push';
+
+  exec(cmd, { cwd: __dirname }, (err, stdout, stderr) => {
+    if (err) {
+      // nothing-to-commit ya push fail -> log only
+      console.log(
+        `[GIT] ${(stderr || err.message || "").trim()}`
+      );
+    } else {
+      console.log("[GIT] blocked.json pushed");
+    }
+  });
+}
+
+// polling error state (baar-baar spam na ho)
+let lastPollErrorMsg = "";   // aakhri error jo admin ko bheja
+let pollErrorActive = false;  // abhi error chal raha hai?
+let lastPollOkTime = Date.now();
 
 const BULK_DEAL_PERCENT =
   0.49;
@@ -216,6 +270,73 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+// ============================================================
+// ADMIN FORWARD
+// ============================================================
+
+async function notifyAdmin(text, options = {}) {
+  try {
+    await bot.sendMessage(ADMIN_CHAT_ID, text, options);
+  } catch (e) {
+    console.log(`[ADMIN] forward fail: ${e.message}`);
+  }
+}
+
+async function forwardIncomingToAdmin(msg, requestedSymbol) {
+  if (String(msg.chat.id) === String(ADMIN_CHAT_ID)) {
+    return;
+  }
+
+  const from = msg.from || {};
+
+  const name = [from.first_name, from.last_name]
+    .filter(Boolean)
+    .join(" ");
+
+  const username = from.username
+    ? "@" + from.username
+    : "(no username)";
+
+  const info =
+    `📨 <b>NEW REQUEST</b>\n\n` +
+    `<b>Name:</b> ${escapeHtml(name || "-")}\n` +
+    `<b>Username:</b> ${escapeHtml(username)}\n` +
+    `<b>User ID:</b> ${escapeHtml(String(from.id || "-"))}\n` +
+    `<b>Chat type:</b> ${escapeHtml(msg.chat.type)}\n` +
+    `<b>Chat ID:</b> ${escapeHtml(String(msg.chat.id))}\n\n` +
+    `<b>Message:</b> ${escapeHtml(msg.text || "")}\n` +
+    `<b>Symbol:</b> ${escapeHtml(requestedSymbol || "-")}`;
+
+  await notifyAdmin(info, { parse_mode: "HTML" });
+}
+
+async function forwardReplyToAdmin(replyText, requestedSymbol) {
+  const header =
+    `↩️ <b>BOT REPLY</b> (${escapeHtml(
+      requestedSymbol || "-"
+    )})\n\n`;
+
+  await notifyAdmin(header + replyText, {
+    parse_mode: "HTML",
+  });
+}
+
+// user/group ko diye gaye reply ko 20 min baad delete karo
+const DELETE_AFTER_MS = 10 * 60 * 1000; // 20 minute
+
+function scheduleDelete(chatId, messageId) {
+  if (!messageId) return;
+
+  setTimeout(() => {
+    bot
+      .deleteMessage(chatId, messageId)
+      .catch((e) => {
+        // 48h se purana ya already deleted -> ignore
+        console.log(`[DELETE] skip: ${e.message}`);
+      });
+  }, DELETE_AFTER_MS);
 }
 
 // ============================================================
@@ -961,6 +1082,20 @@ function parseNseEntry(entry, upperSymbol, foundSeries) {
     isin
   );
 
+  // STATUS: suspended hai ya active
+  const suspFlag = String(sec.isSuspended || "").toLowerCase();
+  const secStatus = String(sec.secStatus || "").toLowerCase();
+
+  const isSuspended =
+    suspFlag.includes("suspend") ||
+    secStatus.includes("suspend");
+
+  const status = isSuspended
+    ? `⛔ SUSPENDED${
+        sec.secStatus ? " (" + sec.secStatus + ")" : ""
+      }`
+    : "✅ ACTIVE";
+
   return {
     exchange: "NSE",
     series: foundSeries || trade.series || meta.series || "-",
@@ -974,6 +1109,8 @@ function parseNseEntry(entry, upperSymbol, foundSeries) {
     applicableMarginRate,
     bulkDeal,
     approval,
+    status,
+    isSuspended,
   };
 }
 
@@ -1072,7 +1209,7 @@ async function getNseDataBySeries(symbol, series) {
 // BSE: fetch APIs
 // ============================================================
 
-// BSE VAR (SecurityVar) - alag API
+// BSE VAR + Applicable Margin (SecurityVar, AMR) - alag API
 async function fetchBseVar(scripCode) {
   const url =
     "https://api.bseindia.com/BseIndiaAPI/api/VarMargin/w" +
@@ -1179,12 +1316,19 @@ async function getBseData(scripRow) {
     return null;
   }
 
-  // BSE VAR (SecurityVar)
+  // BSE VAR (SecurityVar) + Applicable Margin (AMR)
   let securityVar = "N/A";
+  let applicableMarginRate = "N/A";
 
-  if (varData && varData.SecurityVar != null &&
-      cleanNumber(varData.SecurityVar) !== null) {
-    securityVar = String(varData.SecurityVar);
+  if (varData) {
+    if (varData.SecurityVar != null &&
+        cleanNumber(varData.SecurityVar) !== null) {
+      securityVar = String(varData.SecurityVar);
+    }
+    if (varData.AMR != null &&
+        cleanNumber(varData.AMR) !== null) {
+      applicableMarginRate = String(varData.AMR);
+    }
   }
 
   const isin =
@@ -1240,6 +1384,30 @@ async function getBseData(scripRow) {
 
   const approval = checkApproval(scripRow.symbol, isin);
 
+  // STATUS: Category se (Listed / Suspended / Delisted)
+  const category = String(
+    (headerData &&
+      headerData.Cmpname &&
+      headerData.Cmpname.Category) ||
+      (header && header.Category) ||
+      ""
+  );
+
+  const catLower = category.toLowerCase();
+
+  const isSuspended =
+    catLower.includes("suspend") ||
+    catLower.includes("delist");
+
+  let status;
+  if (isSuspended) {
+    status = `⛔ ${category.toUpperCase()}`;
+  } else if (category) {
+    status = `✅ ${category.toUpperCase()}`;
+  } else {
+    status = "N/A";
+  }
+
   console.log(`[BSE] ${scripRow.symbol} done`);
 
   return {
@@ -1256,8 +1424,11 @@ async function getBseData(scripRow) {
     group,
     industry,
     securityVar,
+    applicableMarginRate,
     bulkDeal,
     approval,
+    status,
+    isSuspended,
   };
 }
 
@@ -1297,13 +1468,26 @@ function createNseReply(data) {
       ? "N/A"
       : `₹${formatIndianNumber(data.bulkDeal)} Cr`;
 
+  const varNum = cleanNumber(data.securityVar);
+  let finance;
+  if (data.isSuspended) {
+    finance = "❌ NOT ALLOWED (Suspended)";
+  } else if (varNum === null) {
+    finance = "N/A (VAR nahi mila)";
+  } else if (varNum < 100) {
+    finance = "✅ ALLOWED";
+  } else {
+    finance = "❌ NOT ALLOWED";
+  }
+
   return (
     `📊 <b>STOCK DATA</b>\n\n` +
     `<b>EXCHANGE:</b> NSE\n` +
     `<b>SYMBOL:</b> ${escapeHtml(data.symbol)}\n` +
     `<b>SERIES:</b> ${escapeHtml(data.series)}\n` +
     `<b>COMPANY:</b> ${escapeHtml(data.company)}\n` +
-    `<b>ISIN:</b> ${escapeHtml(data.isin)}\n\n` +
+    `<b>ISIN:</b> ${escapeHtml(data.isin)}\n` +
+    `<b>STATUS:</b> ${escapeHtml(data.status || "N/A")}\n\n` +
     `<b>LTP:</b> ${escapeHtml(ltp)}\n` +
     `<b>PREV CLOSE:</b> ${escapeHtml(prevClose)}\n` +
     `<b>MARKET CAP:</b> ${escapeHtml(marketCap)}\n` +
@@ -1311,8 +1495,9 @@ function createNseReply(data) {
     `<b>APPLICABLE MARGIN:</b> ${escapeHtml(
       applicableMarginRate
     )}\n` +
-    `<b>BULK DEAL (0.49%):</b> ${escapeHtml(bulkDeal)}\n\n` +
-    `<b>APPROVED:</b> ${approved}`
+    `<b>BULK DEAL (0.49%):</b> ${escapeHtml(bulkDeal)}\n` +
+    `<b>APPROVED:</b> ${approved}\n\n` +
+    `<b>FINANCE:</b> ${finance}`
   );
 }
 
@@ -1351,6 +1536,24 @@ function createBseReply(data) {
       ? "N/A"
       : `${data.securityVar}%`;
 
+  const applicableMarginRate =
+    !data.applicableMarginRate ||
+    data.applicableMarginRate === "N/A"
+      ? "N/A"
+      : `${data.applicableMarginRate}%`;
+
+  const varNum = cleanNumber(data.securityVar);
+  let finance;
+  if (data.isSuspended) {
+    finance = "❌ NOT ALLOWED (Suspended)";
+  } else if (varNum === null) {
+    finance = "N/A (VAR nahi mila)";
+  } else if (varNum < 100) {
+    finance = "✅ ALLOWED";
+  } else {
+    finance = "❌ NOT ALLOWED";
+  }
+
   return (
     `📊 <b>STOCK DATA</b>\n\n` +
     `<b>EXCHANGE:</b> BSE\n` +
@@ -1359,13 +1562,18 @@ function createBseReply(data) {
     `<b>COMPANY:</b> ${escapeHtml(data.company)}\n` +
     `<b>ISIN:</b> ${escapeHtml(data.isin)}\n` +
     `<b>GROUP:</b> ${escapeHtml(data.group)}\n` +
-    `<b>INDUSTRY:</b> ${escapeHtml(data.industry)}\n\n` +
+    `<b>INDUSTRY:</b> ${escapeHtml(data.industry)}\n` +
+    `<b>STATUS:</b> ${escapeHtml(data.status || "N/A")}\n\n` +
     `<b>LTP:</b> ${escapeHtml(ltp)}\n` +
     `<b>PREV CLOSE:</b> ${escapeHtml(prevClose)}\n` +
     `<b>WAP:</b> ${escapeHtml(wap)}\n` +
     `<b>MARKET CAP (FULL):</b> ${escapeHtml(marketCap)}\n` +
     `<b>SECURITY VAR:</b> ${escapeHtml(securityVar)}\n` +
-    `<b>BULK DEAL (0.49%):</b> ${escapeHtml(bulkDeal)}\n\n` +
+    `<b>APPLICABLE MARGIN:</b> ${escapeHtml(
+      applicableMarginRate
+    )}\n` +
+    `<b>BULK DEAL (0.49%):</b> ${escapeHtml(bulkDeal)}\n` +
+    `<b>FINANCE:</b> ${finance}\n\n` +
     `<b>APPROVED:</b> ${approved}`
   );
 }
@@ -1637,29 +1845,27 @@ async function handleSymbol(chatId, requestedSymbol) {
 
     // NSE
     if (result.kind === "NSE") {
-      await bot.editMessageText(
-        createNseReply(result.data),
-        {
-          chat_id: chatId,
-          message_id: loadingMessage.message_id,
-          parse_mode: "HTML",
-        }
-      );
-
+      const replyText = createNseReply(result.data);
+      await bot.editMessageText(replyText, {
+        chat_id: chatId,
+        message_id: loadingMessage.message_id,
+        parse_mode: "HTML",
+      });
+      await forwardReplyToAdmin(replyText, requestedSymbol);
+      scheduleDelete(chatId, loadingMessage.message_id);
       return;
     }
 
     // BSE
     if (result.kind === "BSE") {
-      await bot.editMessageText(
-        createBseReply(result.data),
-        {
-          chat_id: chatId,
-          message_id: loadingMessage.message_id,
-          parse_mode: "HTML",
-        }
-      );
-
+      const replyText = createBseReply(result.data);
+      await bot.editMessageText(replyText, {
+        chat_id: chatId,
+        message_id: loadingMessage.message_id,
+        parse_mode: "HTML",
+      });
+      await forwardReplyToAdmin(replyText, requestedSymbol);
+      scheduleDelete(chatId, loadingMessage.message_id);
       return;
     }
 
@@ -1673,35 +1879,42 @@ async function handleSymbol(chatId, requestedSymbol) {
         (m) => m.exchange === "BSE"
       ).length;
 
-      await bot.editMessageText(
+      const suggestText =
         `🔎 <b>${escapeHtml(
           requestedSymbol
         )}</b> exact match nahi mila.\n\n` +
-          `${result.matches.length} results ` +
-          `(NSE: ${nseCount}, BSE: ${bseCount}).\n\n` +
-          `Select karo:`,
-        {
-          chat_id: chatId,
-          message_id: loadingMessage.message_id,
-          parse_mode: "HTML",
-          reply_markup: buildCombinedSuggestionKeyboard(
-            result.matches
-          ),
-        }
-      );
+        `${result.matches.length} results ` +
+        `(NSE: ${nseCount}, BSE: ${bseCount}).\n\n` +
+        `Select karo:`;
+
+      await bot.editMessageText(suggestText, {
+        chat_id: chatId,
+        message_id: loadingMessage.message_id,
+        parse_mode: "HTML",
+        reply_markup: buildCombinedSuggestionKeyboard(
+          result.matches
+        ),
+      });
+
+      await forwardReplyToAdmin(suggestText, requestedSymbol);
+
+      scheduleDelete(chatId, loadingMessage.message_id);
 
       return;
     }
 
     // NOT FOUND
-    await bot.editMessageText(
-      createNotFoundReply(requestedSymbol),
-      {
-        chat_id: chatId,
-        message_id: loadingMessage.message_id,
-        parse_mode: "HTML",
-      }
-    );
+    const notFoundText = createNotFoundReply(requestedSymbol);
+
+    await bot.editMessageText(notFoundText, {
+      chat_id: chatId,
+      message_id: loadingMessage.message_id,
+      parse_mode: "HTML",
+    });
+
+    await forwardReplyToAdmin(notFoundText, requestedSymbol);
+
+    scheduleDelete(chatId, loadingMessage.message_id);
   } catch (error) {
     console.error(
       `[ERROR] ${requestedSymbol}:`,
@@ -1715,6 +1928,8 @@ async function handleSymbol(chatId, requestedSymbol) {
       )}\n\n` +
       escapeHtml(error.message);
 
+    await forwardReplyToAdmin(errorText, requestedSymbol);
+
     if (loadingMessage) {
       try {
         await bot.editMessageText(errorText, {
@@ -1723,13 +1938,17 @@ async function handleSymbol(chatId, requestedSymbol) {
           parse_mode: "HTML",
         });
 
+        scheduleDelete(chatId, loadingMessage.message_id);
+
         return;
       } catch (_) {}
     }
 
-    await bot.sendMessage(chatId, errorText, {
+    const sent = await bot.sendMessage(chatId, errorText, {
       parse_mode: "HTML",
     });
+
+    if (sent) scheduleDelete(chatId, sent.message_id);
   }
 }
 
@@ -1797,6 +2016,7 @@ bot.on("callback_query", async (query) => {
           }
         );
 
+        scheduleDelete(chatId, message.message_id);
         return;
       }
 
@@ -1827,6 +2047,7 @@ bot.on("callback_query", async (query) => {
             }
           );
 
+          scheduleDelete(chatId, message.message_id);
           return;
         }
       }
@@ -1852,6 +2073,7 @@ bot.on("callback_query", async (query) => {
           }
         );
 
+        scheduleDelete(chatId, message.message_id);
         return;
       }
     }
@@ -1865,10 +2087,19 @@ bot.on("callback_query", async (query) => {
         parse_mode: "HTML",
       }
     );
+
+    scheduleDelete(chatId, message.message_id);
   } catch (error) {
     console.error(
       `[CALLBACK ERROR] ${symbol}:`,
       error.message
+    );
+
+    await notifyAdmin(
+      `❌ <b>CALLBACK ERROR</b> (${escapeHtml(
+        symbol
+      )})\n\n${escapeHtml(error.message)}`,
+      { parse_mode: "HTML" }
     );
 
     try {
@@ -1905,26 +2136,134 @@ bot.on("message", async (msg) => {
     chatType === "group" ||
     chatType === "supergroup";
 
-  if (
-    isPrivate &&
-    String(chatId) !== String(ALLOWED_CHAT_ID)
-  ) {
-    console.log(`[BLOCKED PRIVATE] ${chatId}`);
-    return;
-  }
-
   if (!isPrivate && !isGroup) {
     return;
   }
 
-  if (isGroup) {
-    const groupCommand = text.match(
-      /^S\/([A-Z0-9&._-]+)$/i
-    );
+  const isAdmin =
+    String(chatId) === String(ADMIN_CHAT_ID);
 
-    if (!groupCommand) {
+  // -------- ADMIN COMMANDS (sirf admin private) --------
+  if (isAdmin && isPrivate) {
+    const cmd = text.toLowerCase();
+
+    if (cmd === "/block") {
+      blockMode = true;
+      await bot.sendMessage(
+        chatId,
+        "🔒 BLOCK ON — ab sirf admin bot use kar sakega."
+      );
       return;
     }
+
+    if (cmd === "/open") {
+      blockMode = false;
+      await bot.sendMessage(
+        chatId,
+        "🔓 OPEN — ab sabko allow hai."
+      );
+      return;
+    }
+
+    if (cmd === "/status") {
+      await bot.sendMessage(
+        chatId,
+        blockMode
+          ? "🔒 Abhi BLOCK mode (sirf admin)."
+          : "🔓 Abhi OPEN mode (sabko allow)."
+      );
+      return;
+    }
+
+    // ---- block this id : 12345 ----
+    const blockMatch = text.match(
+      /^block\s+this\s+id\s*:?\s*(-?\d+)/i
+    );
+
+    if (blockMatch) {
+      const id = blockMatch[1];
+      blockedIds.add(String(id));
+      saveBlockedIds();
+      await bot.sendMessage(
+        chatId,
+        `⛔ ID <code>${escapeHtml(
+          id
+        )}</code> block ho gaya.\nTotal blocked: ${
+          blockedIds.size
+        }`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    // ---- unblock this id : 12345 ----
+    const unblockMatch = text.match(
+      /^unblock\s+this\s+id\s*:?\s*(-?\d+)/i
+    );
+
+    if (unblockMatch) {
+      const id = unblockMatch[1];
+      const had = blockedIds.delete(String(id));
+      saveBlockedIds();
+      await bot.sendMessage(
+        chatId,
+        had
+          ? `✅ ID <code>${escapeHtml(
+              id
+            )}</code> unblock ho gaya.\nTotal blocked: ${
+              blockedIds.size
+            }`
+          : `ℹ️ ID <code>${escapeHtml(
+              id
+            )}</code> list me tha hi nahi.`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    // ---- blocked list ----
+    if (
+      cmd === "blocked list" ||
+      cmd === "block list" ||
+      cmd === "/blocked"
+    ) {
+      if (blockedIds.size === 0) {
+        await bot.sendMessage(
+          chatId,
+          "📃 Blocked list khali hai."
+        );
+      } else {
+        const list = [...blockedIds]
+          .map((id, i) => `${i + 1}. <code>${escapeHtml(id)}</code>`)
+          .join("\n");
+        await bot.sendMessage(
+          chatId,
+          `📃 <b>BLOCKED IDs (${blockedIds.size})</b>\n\n${list}`,
+          { parse_mode: "HTML" }
+        );
+      }
+      return;
+    }
+  }
+
+  // -------- ye ID blocked hai? (admin chhod ke) --------
+  const fromId = msg.from ? String(msg.from.id) : "";
+
+  if (
+    !isAdmin &&
+    (blockedIds.has(String(chatId)) ||
+      (fromId && blockedIds.has(fromId)))
+  ) {
+    console.log(
+      `[BLOCKED-ID] chat ${chatId} / user ${fromId} ignored`
+    );
+    return;
+  }
+
+  // -------- BLOCK MODE: sirf admin allow --------
+  if (blockMode && !isAdmin) {
+    console.log(`[BLOCKED] ${chatId} (block mode)`);
+    return;
   }
 
   if (
@@ -1935,24 +2274,33 @@ bot.on("message", async (msg) => {
       chatId,
       "📊 NSE + BSE Stock Bot\n\n" +
         "Command:\n" +
-        "S/RELIANCE  (exact)\n" +
-        "S/RELI      (partial -> suggestions)"
+        "RELIANCE     (seedha symbol)\n" +
+        "S/RELIANCE   (S/ ke saath bhi)\n" +
+        "RELI         (partial -> suggestions)"
     );
 
     return;
   }
 
-  const match = text.match(
-    /^S\/([A-Z0-9&._-]+)$/i
-  );
+  // ---- SYMBOL nikalna ----
+  // GROUP: sirf S/SYMBOL
+  // PRIVATE: S/SYMBOL bhi, seedha SYMBOL bhi
+  let requestedSymbol = null;
 
-  if (!match) {
-    return;
+  const withPrefix = text.match(/^S\/([A-Z0-9&._-]+)$/i);
+
+  if (withPrefix) {
+    requestedSymbol = withPrefix[1].trim().toUpperCase();
+  } else if (isPrivate) {
+    const plain = text.match(/^([A-Za-z0-9&._-]+)$/);
+    if (plain) {
+      requestedSymbol = plain[1].trim().toUpperCase();
+    }
   }
 
-  const requestedSymbol = match[1]
-    .trim()
-    .toUpperCase();
+  if (!requestedSymbol) {
+    return;
+  }
 
   // duplicate guard: same symbol 8 sec ke andar dobara -> ignore
   const dupKey = `${chatId}:${requestedSymbol}`;
@@ -1978,6 +2326,8 @@ bot.on("message", async (msg) => {
     `\n[TELEGRAM] ${chatType} ${chatId} → ${requestedSymbol}`
   );
 
+  await forwardIncomingToAdmin(msg, requestedSymbol);
+
   await handleSymbol(chatId, requestedSymbol);
 });
 
@@ -1990,7 +2340,42 @@ bot.on("polling_error", (error) => {
     "TELEGRAM POLLING ERROR:",
     error.message
   );
+
+  const msg = error.message || "unknown";
+
+  // har error par time reset (recovery isi se decide hota hai)
+  lastPollOkTime = Date.now();
+
+  // same error dobara-dobara na bhejo, sirf pehli baar
+  if (pollErrorActive && msg === lastPollErrorMsg) {
+    return;
+  }
+
+  pollErrorActive = true;
+  lastPollErrorMsg = msg;
+
+  notifyAdmin(
+    `⚠️ <b>POLLING ERROR</b>\n\n${escapeHtml(msg)}\n\n` +
+      `(It will appear again only if the error changes or gets resolved.)`,
+    { parse_mode: "HTML" }
+  );
 });
+
+// recovery detect: agar error active tha aur pichle 35s me
+// koi naya poll error nahi aaya -> "OK theek ho gaya" bhejo
+setInterval(() => {
+  if (pollErrorActive) {
+    const sinceErr = Date.now() - lastPollOkTime;
+    if (sinceErr > 35000) {
+      pollErrorActive = false;
+      lastPollErrorMsg = "";
+      notifyAdmin(
+        "✅ <b>OK</b> — The bot is fixed now and is running",
+        { parse_mode: "HTML" }
+      );
+    }
+  }
+}, 30000);
 
 // ============================================================
 // SHUTDOWN
@@ -2009,6 +2394,28 @@ async function shutdown() {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
+process.on("uncaughtException", (err) => {
+  console.error("[UNCAUGHT]", err.message);
+  notifyAdmin(
+    `🛑 <b>UNCAUGHT ERROR</b>\n\n${escapeHtml(
+      err.message
+    )}`,
+    { parse_mode: "HTML" }
+  );
+});
+
+process.on("unhandledRejection", (reason) => {
+  const msg =
+    reason && reason.message
+      ? reason.message
+      : String(reason);
+  console.error("[UNHANDLED]", msg);
+  notifyAdmin(
+    `🛑 <b>UNHANDLED REJECTION</b>\n\n${escapeHtml(msg)}`,
+    { parse_mode: "HTML" }
+  );
+});
+
 // ============================================================
 // START
 // ============================================================
@@ -2020,7 +2427,8 @@ console.log("     NSE + BSE TELEGRAM BOT STARTED");
 console.log(
   "========================================"
 );
-console.log(`Private allowed: ${ALLOWED_CHAT_ID}`);
+console.log(`Admin forward: ${ADMIN_CHAT_ID}`);
+console.log("Private: ALL allowed (direct symbol OK)");
 console.log("Group: only S/SYMBOL");
 console.log("Mode: Pure Node API (NO CHROME)");
 console.log(`NSE series: ${SERIES_LIST.join(", ")}`);
@@ -2030,6 +2438,9 @@ console.log(
 console.log("BSE: live search API (no CSV)");
 
 console.log("Waiting for Telegram messages...\n");
+
+// blocked IDs load karo (blocked.json se)
+loadBlockedIds();
 
 // startup par cookies pehle se le lo (pehli request fast ho)
 ensureNseCookies(true).catch(() => {});
