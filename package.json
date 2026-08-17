@@ -1,0 +1,10 @@
+{
+  "name": "scripmaster-bot",
+  "version": "1.0.0",
+  "description": "NSE BSE Telegram bot",
+  "main": "SCRIP.js",
+  "dependencies": {
+    "node-telegram-bot-api": "0.66.0",
+    "dotenv": "16.4.5"
+  }
+}
