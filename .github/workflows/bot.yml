@@ -9,7 +9,6 @@ concurrency:
   group: telegram-bot
   cancel-in-progress: true
 
-# blocked.json ko wapas commit karne ke liye write permission
 permissions:
   contents: write
 
@@ -22,7 +21,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          # git push kaam kare iske liye token save rahe
           persist-credentials: true
 
       - name: Setup Node.js
@@ -31,7 +29,12 @@ jobs:
           node-version: '20'
 
       - name: Install dependencies
-        run: npm install node-telegram-bot-api dotenv
+        run: |
+          npm install
+          echo "----- installed packages -----"
+          npm ls node-telegram-bot-api dotenv || true
+          echo "----- node_modules check -----"
+          ls node_modules/node-telegram-bot-api/package.json && echo "PACKAGE FOUND" || echo "PACKAGE MISSING"
 
       - name: Run bot
         env:
